@@ -111,6 +111,46 @@ func RunClient(args []string) {
 // Side effects: opens and closes a UDP socket, writes OPEN and RETY datagrams, sets read
 // deadlines on that socket, and logs progress to stderr.
 func Fetch(address string, filename string) ([]byte, error) {
+	stats := fetchStats{start: time.Now()}
+	file_data, err := fetch(address, filename, &stats)
+	stats.log(filename, err)
+	return file_data, err
+}
+
+// fetchStats summarizes one download for the experiments: how many OPENs it took, how many
+// chunks were missing after the first pass and before each RETY round, and how it ended.
+type fetchStats struct {
+	start            time.Time
+	opens            int
+	numChunks        int
+	missingAfterOpen int
+	missingByRound   []int
+	retysSent        int
+	finalMissing     int
+}
+
+// log writes the summary as one "STATS key=value ..." line to stderr (the gateway's log).
+func (stats *fetchStats) log(filename string, err error) {
+	var serverError *ServerError
+	result := "ok"
+	switch {
+	case errors.Is(err, ErrIncomplete):
+		result = "incomplete"
+	case errors.Is(err, ErrNoData):
+		result = "nodata"
+	case errors.As(err, &serverError):
+		result = "server-error"
+	case err != nil:
+		result = "error"
+	}
+	fmt.Fprintf(os.Stderr, "STATS file=%v chunks=%v opens=%v missing_after_open=%v rounds=%v retys=%v missing_by_round=%v final_missing=%v dur_ms=%v result=%v\n",
+		filename, stats.numChunks, stats.opens, stats.missingAfterOpen, len(stats.missingByRound), stats.retysSent,
+		strings.Join(strings.Fields(fmt.Sprint(stats.missingByRound)), ","), stats.finalMissing,
+		time.Since(stats.start).Milliseconds(), result)
+}
+
+// fetch is the body of Fetch; it fills in stats as it goes.
+func fetch(address string, filename string, stats *fetchStats) ([]byte, error) {
 	var conn *net.UDPConn
 	defer func() {
 		if conn != nil {
@@ -126,6 +166,7 @@ func Fetch(address string, filename string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		stats.opens++
 		_, err = fmt.Fprintf(conn, "OPEN %v", filename)
 		if err != nil {
 			return nil, fmt.Errorf("sending OPEN: %w", err)
@@ -138,13 +179,19 @@ func Fetch(address string, filename string) ([]byte, error) {
 	if num_chunks == 0 {
 		return nil, ErrNoData
 	}
+	stats.numChunks = num_chunks
 
 	silent := false
 	for round := 0; round < maxRetryRounds; round++ {
 		missing := missingChunkIds(chunks, num_chunks)
+		if round == 0 {
+			stats.missingAfterOpen = len(missing)
+		}
 		if len(missing) == 0 {
 			break
 		}
+		stats.missingByRound = append(stats.missingByRound, len(missing))
+		stats.retysSent += len(missing)
 		if silent {
 			// The last round brought nothing back: that server may be gone or the flow dead.
 			var err error
@@ -169,6 +216,7 @@ func Fetch(address string, filename string) ([]byte, error) {
 	}
 
 	missing := missingChunkIds(chunks, num_chunks)
+	stats.finalMissing = len(missing)
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("%w: %v", ErrIncomplete, missing)
 	}

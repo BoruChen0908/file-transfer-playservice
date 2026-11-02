@@ -52,6 +52,7 @@ func (transport *UDPTransport) Receive() (string, protocol.Peer, error) {
 			return "", nil, err
 		}
 		if loss.ShouldDrop(transport.recvLossPercent) {
+			protocol.SimulatedRecvDrops.Add(1)
 			fmt.Fprintf(os.Stderr, "DEBUG: Simulated loss: dropped incoming datagram (%v bytes)\n", n)
 			continue
 		}
@@ -68,6 +69,7 @@ func (transport *UDPTransport) Receive() (string, protocol.Peer, error) {
 // Side effects: sends a datagram to to, or logs the drop to stderr instead.
 func (transport *UDPTransport) Send(to protocol.Peer, message []byte) error {
 	if loss.ShouldDrop(transport.sendLossPercent) {
+		protocol.SimulatedSendDrops.Add(1)
 		fmt.Fprintf(os.Stderr, "DEBUG: Simulated loss: dropped outgoing datagram (%v bytes)\n", len(message))
 		return nil
 	}

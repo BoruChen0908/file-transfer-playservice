@@ -8,12 +8,67 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	tcpdata "example.com/go-file-transfer/transfer-data"
 )
 
 func printDebugMessage(message string) {
 	fmt.Fprintf(os.Stderr, "DEBUG: %v\n", message)
+}
+
+// Counters for the experiments. Serve logs them every statsInterval as one "METRICS" line
+// (cumulative since start), so the drops and the S3 cost of retries can be read from the logs.
+var (
+	received      atomic.Int64 // messages Serve got from the transport
+	overloadDrops atomic.Int64 // messages dropped because every worker was busy and the queue full
+	opens         atomic.Int64
+	retries       atomic.Int64
+	fetches       atomic.Int64 // source.Fetch calls (one per OPEN and one per RETY)
+	fetchedBytes  atomic.Int64
+	fetchNanos    atomic.Int64
+	chunksSent    atomic.Int64
+	peakQueue     atomic.Int64 // largest queue length seen since the last METRICS line
+
+	// SimulatedRecvDrops and SimulatedSendDrops are counted by the transport.
+	SimulatedRecvDrops atomic.Int64
+	SimulatedSendDrops atomic.Int64
+)
+
+const statsInterval = 10 * time.Second
+
+// logStats prints the counters every statsInterval until done is closed, skipping intervals
+// in which nothing was received.
+func logStats(done <-chan struct{}) {
+	ticker := time.NewTicker(statsInterval)
+	defer ticker.Stop()
+	last := int64(-1)
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+		}
+		now := received.Load()
+		if now == last {
+			continue
+		}
+		last = now
+		fmt.Fprintf(os.Stderr, "METRICS received=%v overload_drops=%v sim_recv_drops=%v sim_send_drops=%v opens=%v retys=%v fetches=%v fetched_bytes=%v fetch_ms=%v chunks_sent=%v peak_queue=%v\n",
+			now, overloadDrops.Load(), SimulatedRecvDrops.Load(), SimulatedSendDrops.Load(), opens.Load(), retries.Load(),
+			fetches.Load(), fetchedBytes.Load(), fetchNanos.Load()/int64(time.Millisecond), chunksSent.Load(), peakQueue.Swap(0))
+	}
+}
+
+// fetchCounted is source.Fetch plus the fetch counters.
+func fetchCounted(source FileSource, name string) ([]byte, error) {
+	start := time.Now()
+	data, err := source.Fetch(name)
+	fetches.Add(1)
+	fetchNanos.Add(int64(time.Since(start)))
+	fetchedBytes.Add(int64(len(data)))
+	return data, err
 }
 
 // FileSource supplies the bytes of a named file. Fetch must be safe for concurrent use.
@@ -53,6 +108,9 @@ func Serve(transport Transport, source FileSource, workers int) {
 	// is needed because handleCommand and the functions below it share no mutable state:
 	// each call fetches the file from source and builds its own packets.
 	jobs := make(chan job, workers*4)
+	done := make(chan struct{})
+	defer close(done)
+	go logStats(done)
 	var running sync.WaitGroup
 	for worker := 0; worker < workers; worker++ {
 		running.Add(1)
@@ -77,9 +135,14 @@ func Serve(transport Transport, source FileSource, workers int) {
 		}
 		// A non-blocking send: if the queue is full we drop the message instead of
 		// stalling the reader, which would bring back one-request-at-a-time behavior.
+		received.Add(1)
 		select {
 		case jobs <- job{message: message, from: from}:
+			if depth := int64(len(jobs)); depth > peakQueue.Load() {
+				peakQueue.Store(depth) // only this goroutine raises it, so no lost update
+			}
 		default:
+			overloadDrops.Add(1)
 			printDebugMessage("Overloaded: dropped incoming datagram")
 		}
 	}
@@ -124,8 +187,9 @@ func handleCommand(transport Transport, source FileSource, message string, from 
 // The file is only held in local variables, so it is freed once the send finishes.
 func handleOpen(transport Transport, source FileSource, to Peer, filename string) {
 	printDebugMessage(fmt.Sprintf("Processing OPEN for file: \"%v\"", filename))
+	opens.Add(1)
 
-	file_data, err := source.Fetch(filename)
+	file_data, err := fetchCounted(source, filename)
 	if err != nil {
 		printDebugMessage("Error fetching file: " + err.Error())
 		sendError(transport, to, "file-not-found")
@@ -146,8 +210,9 @@ func handleOpen(transport Transport, source FileSource, to Peer, filename string
 // The file is fetched from source again and dropped after the chunk is sent.
 func handleRetry(transport Transport, source FileSource, to Peer, filename string, idText string) {
 	printDebugMessage(fmt.Sprintf("Processing RETY for file: \"%v\" chunk %v", filename, idText))
+	retries.Add(1)
 
-	file_data, err := source.Fetch(filename)
+	file_data, err := fetchCounted(source, filename)
 	if err != nil {
 		printDebugMessage("Error fetching file: " + err.Error())
 		sendError(transport, to, "file-not-found")
@@ -181,5 +246,6 @@ func sendPack(transport Transport, to Peer, pack tcpdata.UDP_Pack) error {
 	// []byte(fmt.Sprintf(...)) would build a string and then copy it into a slice.
 	message := fmt.Appendf(nil, "%d %d %d ", pack.Id, pack.Num_Packs, pack.Data.Size)
 	message = append(message, pack.Data.Data[:]...)
+	chunksSent.Add(1)
 	return transport.Send(to, message)
 }
