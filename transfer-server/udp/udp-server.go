@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	transferdata "example.com/go-file-transfer/transfer-data"
 	"example.com/go-file-transfer/transfer-server/health"
 	"example.com/go-file-transfer/transfer-server/loss"
 	"example.com/go-file-transfer/transfer-server/opts"
@@ -124,6 +125,7 @@ func RunServer(args []string) {
 
 	var draining atomic.Bool
 	go health.Serve(":"+healthPort, &draining)
+	go transferdata.LogUDPCounters(10 * time.Second)
 
 	fmt.Printf("Listening on UDP port %v (health check on TCP port %v) with %v workers\n", port, healthPort, workers)
 	if sendLossPercent > 0 || recvLossPercent > 0 {

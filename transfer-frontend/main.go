@@ -13,6 +13,7 @@ import (
 
 	"example.com/go-file-transfer/transfer-client/tcp"
 	"example.com/go-file-transfer/transfer-client/udp"
+	transferdata "example.com/go-file-transfer/transfer-data"
 	"example.com/go-file-transfer/transfer-frontend/gateway"
 )
 
@@ -78,6 +79,7 @@ func main() {
 
 	fmt.Printf("Serving http://%v/files, fetching over %v from %v (up to %v at once)\n", listen, transport, upstream, maxInFlight)
 	frontend := gateway.New(upstream, fetch, maxInFlight, queueWait)
+	go transferdata.LogUDPCounters(10 * time.Second)
 
 	// On SIGTERM (a scale-in or deploy) report unhealthy first so the load balancer stops
 	// sending new requests, wait for it to notice, let running downloads finish, then exit.

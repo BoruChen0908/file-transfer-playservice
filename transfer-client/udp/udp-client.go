@@ -111,8 +111,9 @@ func RunClient(args []string) {
 // Side effects: opens and closes a UDP socket, writes OPEN and RETY datagrams, sets read
 // deadlines on that socket, and logs progress to stderr.
 func Fetch(address string, filename string) ([]byte, error) {
-	stats := fetchStats{start: time.Now()}
+	stats := fetchStats{start: time.Now(), rcvbufErrors: rcvbufErrors()}
 	file_data, err := fetch(address, filename, &stats)
+	stats.rcvbufErrors = rcvbufErrors() - stats.rcvbufErrors
 	stats.log(filename, err)
 	return file_data, err
 }
@@ -127,6 +128,19 @@ type fetchStats struct {
 	missingByRound   []int
 	retysSent        int
 	finalMissing     int
+	// rcvbufErrors is how many datagrams the kernel dropped during this download because a
+	// socket's receive buffer was full (for the whole task, so it includes any download
+	// running at the same time). -1 when the counter cannot be read.
+	rcvbufErrors int64
+}
+
+// rcvbufErrors returns the task's UDP RcvbufErrors counter, or -1 when it cannot be read.
+func rcvbufErrors() int64 {
+	counters, err := transferdata.UDPCounters()
+	if err != nil {
+		return -1
+	}
+	return counters["RcvbufErrors"]
 }
 
 // log writes the summary as one "STATS key=value ..." line to stderr (the gateway's log).
@@ -143,9 +157,9 @@ func (stats *fetchStats) log(filename string, err error) {
 	case err != nil:
 		result = "error"
 	}
-	fmt.Fprintf(os.Stderr, "STATS file=%v chunks=%v opens=%v missing_after_open=%v rounds=%v retys=%v missing_by_round=%v final_missing=%v dur_ms=%v result=%v\n",
+	fmt.Fprintf(os.Stderr, "STATS file=%v chunks=%v opens=%v missing_after_open=%v rounds=%v retys=%v missing_by_round=%v final_missing=%v rcvbuf_errors=%v dur_ms=%v result=%v\n",
 		filename, stats.numChunks, stats.opens, stats.missingAfterOpen, len(stats.missingByRound), stats.retysSent,
-		strings.Join(strings.Fields(fmt.Sprint(stats.missingByRound)), ","), stats.finalMissing,
+		strings.Join(strings.Fields(fmt.Sprint(stats.missingByRound)), ","), stats.finalMissing, stats.rcvbufErrors,
 		time.Since(stats.start).Milliseconds(), result)
 }
 
